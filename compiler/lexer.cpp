@@ -1035,6 +1035,7 @@ void TokenLexerCommon::init() {
   add_rule(h, ".=", tok_set_dot);
   add_rule(h, ">>=", tok_set_shr);
   add_rule(h, "<<=", tok_set_shl);
+  add_rule(h, "\?\?=", tok_set_null_coalesce); // escaping ? to avoid trigraphs
 
   add_rule(h, "=>", tok_double_arrow);
   add_rule(h, "::", tok_double_colon);

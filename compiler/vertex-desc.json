@@ -1291,6 +1291,18 @@
     }
   },
   {
+    "name": "op_set_null_coalesce",
+    "base_name": "op_set_modify",
+    "props": {
+      "base_op": "op_null_coalesce",
+      "cnst": "cnst_nonconst_func",
+      "fixity": "right_opp",
+      "rl": "rl_set",
+      "type": "binary_op",
+      "str": "\\?\\?="
+    }
+  },
+  {
     "sons": {
       "true_expr": 1,
       "cond": 0,
