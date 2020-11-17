@@ -6,6 +6,7 @@
 
 #include <sstream>
 
+#include "common/algorithms/contains.h"
 #include "common/algorithms/find.h"
 #include "common/type_traits/constexpr_if.h"
 
@@ -26,6 +27,57 @@
 #include "compiler/vertex.h"
 
 #define CE(x) if (!(x)) {return {};}
+
+// FindImplicitUses walks the arrow function body and finds variables
+// that need to be captured (by value)
+struct FindImplicitUses {
+  FindImplicitUses(VertexAdaptor<op_func_param_list> param_list, std::vector<VertexAdaptor<op_func_param>> *uses_of_lambda):
+    uses_of_lambda_{uses_of_lambda} {
+    skip_set_.reserve(param_list->params().size());
+    for (auto p : param_list->params()) {
+      skip_set_.insert(p.as<op_func_param>()->var()->str_val);
+    }
+  }
+
+  void run(VertexPtr root) {
+    if (auto v = root.try_as<op_var>()) {
+      visit_var(v);
+    }
+
+    // nested anon functions or arrow functions are converted
+    // to a constructor call (op_func_call), so we don't need
+    // to treat them in any special way here
+    if (root->type() == op_list_ce) {
+      // do not capture vars in the `list(...)` assignment LHS
+      return;
+    }
+
+    for (auto &v : *root) {
+      run(v);
+    }
+  }
+
+  void visit_var(VertexAdaptor<op_var> v) {
+    const auto &name = v->get_string();
+    if (name == "this") {
+      return;
+    }
+    if (GenTree::is_superglobal(name)) {
+      return;
+    }
+    if (vk::contains(name, "::")) { // skip other class (and self::*) members
+      return;
+    }
+    if (vk::contains(skip_set_, name)) {
+      return;
+    }
+    uses_of_lambda_->emplace_back(VertexAdaptor<op_func_param>::create(v));
+    skip_set_.insert(name);
+  }
+
+  std::vector<VertexAdaptor<op_func_param>> *uses_of_lambda_;
+  std::unordered_set<std::string> skip_set_;
+};
 
 GenTree::GenTree(vector<Token> tokens, SrcFilePtr file, DataStream<FunctionPtr> &os) :
   tokens(std::move(tokens)),
@@ -551,12 +603,16 @@ VertexPtr GenTree::get_expr_top(bool was_arrow) {
     }
     case tok_static:
       next_cur();
-      res = get_anonymous_function(true);
+      if (cur->type() == tok_fn) {
+        res = get_anonymous_function(tok_fn, true);
+      } else {
+        res = get_anonymous_function(tok_function, true);
+      }
       break;
-    case tok_function: {
-      res = get_anonymous_function();
+    case tok_function:
+    case tok_fn:
+      res = get_anonymous_function(type);
       break;
-    }
     case tok_isset: {
       auto temp = get_multi_call<op_isset, op_none>(&GenTree::get_expression, true);
       CE (!kphp_error(temp->size(), "isset function requires at least one argument"));
@@ -1362,9 +1418,9 @@ bool GenTree::check_uses_and_args_are_not_intersecting(const std::vector<VertexA
                       [&](VertexPtr p) { return uniq_uses.find(p.as<meta_op_func_param>()->var()->get_string()) != uniq_uses.end(); });
 }
 
-VertexAdaptor<op_func_call> GenTree::get_anonymous_function(bool is_static/* = false*/) {
+VertexAdaptor<op_func_call> GenTree::get_anonymous_function(TokenType tok, bool is_static/* = false*/) {
   std::vector<VertexAdaptor<op_func_param>> uses_of_lambda;
-  auto anon_function = get_function(vk::string_view{}, FunctionModifiers::nonmember(), &uses_of_lambda);
+  auto anon_function = get_function(tok, vk::string_view{}, FunctionModifiers::nonmember(), &uses_of_lambda);
 
   if (anon_function) {
     // it's a constructor call
@@ -1422,7 +1478,7 @@ VertexPtr GenTree::get_class_member(vk::string_view phpdoc_str) {
   const TokenType cur_tok = cur == end ? tok_end : cur->type();
 
   if (cur_tok == tok_function) {
-    return get_function(phpdoc_str, modifiers);
+    return get_function(tok_function, phpdoc_str, modifiers);
   }
 
   if (cur_tok == tok_var_name) {
@@ -1456,8 +1512,13 @@ VertexAdaptor<op_func_param_list> GenTree::parse_cur_function_param_list() {
   return VertexAdaptor<op_func_param_list>::create(params_next).set_location(cur_function->root);
 }
 
-VertexAdaptor<op_function> GenTree::get_function(vk::string_view phpdoc_str, FunctionModifiers modifiers, std::vector<VertexAdaptor<op_func_param>> *uses_of_lambda) {
-  expect(tok_function, "'function'");
+VertexAdaptor<op_function> GenTree::get_function(TokenType tok, vk::string_view phpdoc_str, FunctionModifiers modifiers, std::vector<VertexAdaptor<op_func_param>> *uses_of_lambda) {
+  bool is_arrow = (tok == tok_fn);
+  if (is_arrow) {
+    expect(tok_fn, "'fn'");
+  } else {
+    expect(tok_function, "'function'");
+  }
   auto func_location = auto_location();
 
   std::string func_name;
@@ -1465,11 +1526,11 @@ VertexAdaptor<op_function> GenTree::get_function(vk::string_view phpdoc_str, Fun
 
   // a function name is a token that immediately follow a 'function' token (full$$name inside a class)
   if (is_lambda) {
-    func_name = gen_anonymous_function_name(cur_function);   // cur_function is a parent function here
+    func_name = gen_anonymous_function_name(cur_function); // cur_function is a parent function here
   } else {
     CE(expect(tok_func_name, "'tok_func_name'"));
     func_name = static_cast<string>(std::prev(cur)->str_val);
-    if (cur_class) {        // fname inside a class is full$class$name$$fname
+    if (cur_class) { // fname inside a class is full$class$name$$fname
       func_name = replace_backslashes(cur_class->name) + "$$" + func_name;
     }
   }
@@ -1493,9 +1554,11 @@ VertexAdaptor<op_function> GenTree::get_function(vk::string_view phpdoc_str, Fun
 
   // function params follow the function name, followed by the 'use' list for closures
   CE(cur_function->root->params_ref() = parse_cur_function_param_list());
-  CE(parse_function_uses(uses_of_lambda));
-  kphp_error(!uses_of_lambda || check_uses_and_args_are_not_intersecting(*uses_of_lambda, cur_function->get_params()),
-             "arguments and captured variables(in `use` clause) must have different names");
+  if (!is_arrow) {
+    CE(parse_function_uses(uses_of_lambda));
+    kphp_error(!uses_of_lambda || check_uses_and_args_are_not_intersecting(*uses_of_lambda, cur_function->get_params()),
+               "arguments and captured variables(in `use` clause) must have different names");
+  }
   // declarations from the functions.txt may contain ':::' after that
   cur_function->root->type_rule = get_func_param_type_rule();
   if (is_lambda) {
@@ -1509,8 +1572,14 @@ VertexAdaptor<op_function> GenTree::get_function(vk::string_view phpdoc_str, Fun
     kphp_error(!cur_function->return_typehint.empty(), "Expected return typehint after :");
   }
 
-  // then we have '{ cmd }' or ';' — function is marked as func_extern in the latter case
-  if (test_expect(tok_opbrc)) {
+  if (is_arrow) {
+    CE (expect(tok_double_arrow, "'=>'"));
+    auto body_expr = get_expression();
+    CE (!kphp_error(body_expr, "Bad expression in arrow function body"));
+    FindImplicitUses{cur_function->root->params(), uses_of_lambda}.run(body_expr);
+    auto return_stmt = VertexAdaptor<op_return>::create(body_expr);
+    cur_function->root->cmd_ref() = VertexAdaptor<op_seq>::create(return_stmt);
+  } else if (test_expect(tok_opbrc)) { // then we have '{ cmd }' or ';' — function is marked as func_extern in the latter case
     CE(!kphp_error(!cur_function->modifiers.is_abstract(), fmt_format("abstract methods must have empty body: {}", cur_function->get_human_readable_name())));
     is_top_of_the_function_ = true;
     cur_function->root->cmd_ref() = get_statement().as<op_seq>();
@@ -2064,7 +2133,7 @@ VertexPtr GenTree::get_statement(vk::string_view phpdoc_str) {
       if (cur_class) {      // no access modifier implies 'public'
         return get_class_member(phpdoc_str);
       }
-      return get_function(phpdoc_str, FunctionModifiers::nonmember());
+      return get_function(tok_function, phpdoc_str, FunctionModifiers::nonmember());
 
     case tok_try: {
       auto location = auto_location();
@@ -2254,6 +2323,19 @@ void GenTree::run() {
     fmt_fprintf(stderr, "line {}: something wrong\n", line_num);
     kphp_error (0, "Cannot compile (probably problems with brace balance)");
   }
+}
+
+bool GenTree::is_superglobal(const string &s) {
+  static std::set<string> names = {
+    "_SERVER",
+    "_GET",
+    "_POST",
+    "_FILES",
+    "_COOKIE",
+    "_REQUEST",
+    "_ENV"
+  };
+  return vk::contains(names, s);
 }
 
 #undef CE
